@@ -1,3 +1,9 @@
+# Parthavi
+# AI SDLC Navigator
+# A living project dashboard that tracks requirements, planning, and development
+# guidance for a software feature, and recalculates risk/readiness scores as the
+# project's inputs (requirement, team, timeline, dependencies) change over time.
+
 import streamlit as st
 from ai_service import call_ai
 import json
@@ -7,10 +13,34 @@ from project_storage import save_project, load_project, list_saved_projects, del
 import re
 import hashlib
 
+
+# Behavior:
+#   - Builds a fingerprint of every input that affects the project plan (requirement,
+#     team, timeline, dependencies, requirement analysis). Used to detect whether the
+#     plan has gone stale since it was last generated.
+# Parameters:
+#   - project: the current project dictionary
+# Returns:
+#   - str: an MD5 hash string representing the current state of the plan's inputs
 def get_plan_inputs_hash(project):
     relevant = f"{project['requirement']}|{project['team']}|{project['timeline']}|{project['dependencies']}|{project['requirement_output']}"
     return hashlib.md5(relevant.encode()).hexdigest()
 
+
+# Behavior:
+#   - Deterministically (no AI call) estimates Capacity Fit and Dependency Risk for a
+#     project, based on team headcount/roles, timeline length, and how many external
+#     dependencies are mentioned. This is calculated in plain Python rather than asked
+#     of the AI, since counting/comparing numbers is a task language models handle
+#     unreliably.
+# Parameters:
+#   - project: the current project dictionary (reads team, timeline, dependencies)
+#   - num_steps: the number of steps in the current project plan, used to judge whether
+#     the timeline leaves enough time per step
+# Returns:
+#   - tuple of (capacity_fit, capacity_reasoning, dependency_risk, dependency_reasoning)
+#     where the *_fit/*_risk values are one of "Low Risk", "Medium Risk", "High Risk",
+#     and the *_reasoning values are short strings explaining the rating
 def calculate_capacity_and_dependency_risk(project, num_steps):
     team_text = project["team"].lower()
     timeline_text = project["timeline"].lower()
@@ -84,6 +114,17 @@ def calculate_capacity_and_dependency_risk(project, num_steps):
 
     return capacity_fit, capacity_reasoning, dependency_risk, dependency_reasoning
 
+
+# Behavior:
+#   - Compares an old and new version of a text field and returns the "after" text with
+#     only the newly added/changed words wrapped in green markdown, so unchanged text
+#     stays plain and only genuine edits are highlighted.
+# Parameters:
+#   - before: str, the original text
+#   - after: str, the updated text
+# Returns:
+#   - str: the "after" text, with inserted/changed words wrapped in Streamlit's
+#     ":green[...]" markdown syntax
 def highlight_word_diff(before, after):
     before_words = before.split()
     after_words = after.split()
@@ -104,6 +145,15 @@ def highlight_word_diff(before, after):
 
     return " ".join(result)
 
+
+# Behavior:
+#   - Cleans up a text value so that trivial differences (leading/trailing whitespace,
+#     smart quotes vs. straight quotes, en/em dashes vs. hyphens) don't get treated as
+#     real changes when comparing project field values.
+# Parameters:
+#   - value: any project field value (only strings are modified; other types pass through)
+# Returns:
+#   - the normalized value, safe to use for equality comparisons
 def normalize(value):
     if isinstance(value, str):
         text = value.strip()
@@ -118,6 +168,18 @@ def normalize(value):
         return text
     return value
 
+
+# Behavior:
+#   - Compares two versions of the project's core input fields (name, team, timeline,
+#     dependencies, requirement, business goal, constraints) and reports which fields
+#     actually changed. Values are normalized before comparing, so whitespace/smart-quote
+#     differences don't register as false changes.
+# Parameters:
+#   - old: the previous project dictionary (or snapshot of one)
+#   - new: the current project dictionary
+# Returns:
+#   - dict: keyed by field name, each value a dict with "before" and "after" (the
+#     original, non-normalized text, for display purposes)
 def diff_project(old, new):
     changes = {}
     fields_to_check = ["project_name", "team", "timeline", "dependencies", "requirement", "business_goal", "constraints"]
@@ -128,6 +190,17 @@ def diff_project(old, new):
             changes[field] = {"before": old.get(field), "after": new.get(field)}
     return changes
 
+
+# Behavior:
+#   - Appends a snapshot of the project's three numeric scores (requirement quality,
+#     planning confidence, dev readiness) to the project's score history, tagged with a
+#     sequence number and a human-readable label. Used to build the Overview tab's score
+#     trend chart.
+# Parameters:
+#   - project: the current project dictionary
+#   - label: a short description of what triggered this snapshot (e.g. "Planning updated")
+# Returns:
+#   - None (modifies project["score_history"] in place)
 def record_score_snapshot(project, label):
     sequence_number = len(project["score_history"]) + 1
     project["score_history"].append({
@@ -139,6 +212,14 @@ def record_score_snapshot(project, label):
         "development_readiness": project["scores"]["development_readiness"] if isinstance(project["scores"]["development_readiness"], (int, float)) else 0,
     })
 
+
+# Behavior:
+#   - Maps a team role (e.g. "Backend developer") to a consistent display color, used so
+#     each discipline is visually recognizable throughout the Planning tab.
+# Parameters:
+#   - role_text: str, a role name (e.g. "Backend developer 1", "QA")
+# Returns:
+#   - str: a Streamlit-recognized color name (e.g. "blue", "green", "orange")
 def get_role_color(role_text):
         role_lower = role_text.lower()
         if "backend" in role_lower:
@@ -155,6 +236,14 @@ def get_role_color(role_text):
             return "gray"
 
 
+# Behavior:
+#   - Takes a plan step's "assigned to" text (which may list multiple roles separated by
+#     commas or "and") and wraps each individual role in its matching color, so a
+#     multi-owner step is still easy to read at a glance.
+# Parameters:
+#   - assigned_to_text: str, e.g. "Backend developer(s), Frontend developer(s), QA"
+# Returns:
+#   - str: the same roles, each wrapped in Streamlit color markdown, joined by commas
 def colorize_roles(assigned_to_text):
     # assigned_to_text may list multiple roles separated by commas or "and"
     parts = re.split(r',| and ', assigned_to_text)
@@ -172,6 +261,8 @@ st.set_page_config(page_title="AI SDLC Navigator", layout="wide")
 # -----------------------------
 # Initialize project state
 # -----------------------------
+# On first load, create a blank project in session state so every tab has a consistent
+# data structure to read from and write to.
 if "project" not in st.session_state:
     st.session_state.project = {
         "project_name": "Untitled Project",
@@ -195,6 +286,7 @@ if "project" not in st.session_state:
     }
 
 project = st.session_state.project
+# Guard against older saved projects that predate the score_history feature
 project.setdefault("score_history", [])
 
 # -----------------------------
@@ -206,9 +298,19 @@ st.caption("Living project dashboard for requirements, planning, and development
 # -----------------------------
 # Sidebar
 # -----------------------------
+# Contains: project selector (create/load/delete), core project setup fields, autosave,
+# and the "Log a Change" panel used to record and summarize edits.
 with st.sidebar:
     st.header("Project Setup")
 
+    # Behavior:
+    #   - Callback fired when the user picks a different option in the project dropdown.
+    #     Either resets to a blank project ("+ New Project") or loads the selected saved
+    #     project, then resets the change-tracking baseline to match.
+    # Parameters:
+    #   - none (reads the selected value from st.session_state.project_selector)
+    # Returns:
+    #   - None (updates st.session_state.project and st.session_state.last_snapshot)
     def handle_project_switch():
         selected = st.session_state.project_selector
         if selected == "+ New Project":
@@ -237,24 +339,30 @@ with st.sidebar:
             st.session_state.project = load_project(selected)
         st.session_state.last_snapshot = dict(st.session_state.project)
 
+    # Build the project dropdown: "+ New Project" plus every saved project file
     saved_files = list_saved_projects()
     dropdown_options = ["+ New Project"] + saved_files
 
+    # Figure out which saved file (if any) matches the currently loaded project
     current_filename = (
         project["project_name"].strip().replace(" ", "_").lower() + ".json"
         if project["project_name"].strip() else "+ New Project"
     )
 
+    # Initialize the dropdown's selection once; afterward Streamlit manages it via its key
     if "project_selector" not in st.session_state:
         st.session_state.project_selector = current_filename if current_filename in dropdown_options else "+ New Project"
 
     st.selectbox("Project", dropdown_options, key="project_selector", on_change=handle_project_switch)
 
+    # Core project setup fields — these live at the top level of `project` and feed
+    # every AI prompt and the live capacity/dependency calculation below
     project["project_name"] = st.text_input("Project Name", value=project["project_name"])
     project["team"] = st.text_area("Team", value=project["team"], placeholder="e.g. 1 backend, 1 frontend, 1 QA")
     project["timeline"] = st.text_input("Timeline", value=project["timeline"], placeholder="e.g. 4 weeks")
     project["dependencies"] = st.text_area("Known Dependencies", value=project["dependencies"])
 
+    # Autosave: writes the current project to disk on every rerun once it has a real name
     if project["project_name"].strip() and project["project_name"] != "Untitled Project":
         save_project(project)
         st.caption(f"Autosaved at {datetime.datetime.now().strftime('%I:%M:%S %p')}")
@@ -262,9 +370,11 @@ with st.sidebar:
     st.divider()
     st.header("Log a Change")
 
+    # The baseline snapshot that new edits get compared against
     if "last_snapshot" not in st.session_state:
         st.session_state.last_snapshot = dict(project)
 
+    # Live-computed diff between the last logged snapshot and the current project state
     pending_changes = diff_project(st.session_state.last_snapshot, project)
 
     if pending_changes:
@@ -272,6 +382,8 @@ with st.sidebar:
     else:
         st.caption("No changes made since last log.")
 
+    # "Record Change" is disabled whenever there's nothing pending, so a change can only
+    # be logged once, not duplicated
     if st.button("Record Change", disabled=not pending_changes):
         changes = pending_changes
         change_summary_text = "\n".join(
@@ -305,8 +417,12 @@ with st.sidebar:
         st.session_state.last_snapshot = dict(project)
         st.success(f"Recorded {len(changes)} change(s).")
         st.rerun()
-        
+
     st.divider()
+
+    # Delete option — only shown when an actual saved project (not "+ New Project") is
+    # currently loaded, and requires an explicit confirmation checkbox before enabling
+    # the delete button
     if current_filename != "+ New Project" and current_filename in saved_files:
         with st.expander("Delete this project"):
             st.markdown(":red[This permanently deletes the saved project file. This cannot be undone.]")
@@ -335,10 +451,12 @@ with st.sidebar:
                     "score_history": [],
                 }
                 st.session_state.last_snapshot = dict(st.session_state.project)
+                # Delete (rather than overwrite) the dropdown's key so it can safely
+                # re-initialize to "+ New Project" on the next run
                 del st.session_state["project_selector"]
                 st.success("Project deleted.")
                 st.rerun()
-        
+
 # -----------------------------
 # Live recalculation of Capacity Fit / Dependency Risk
 # (runs every time the page reruns, so it reflects the current team/timeline/dependencies immediately)
@@ -354,6 +472,7 @@ project["scores"]["dependency_risk"] = live_dependency_risk
 # -----------------------------
 # Health score cards
 # -----------------------------
+# Always-visible snapshot of the project's five key scores
 st.subheader("Project Health")
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Requirement Quality", project["scores"]["requirement_quality"])
@@ -369,6 +488,9 @@ overview_tab, req_tab, plan_tab, dev_tab, log_tab = st.tabs(
     ["Overview", "Requirement", "Planning", "Dev Guidance", "Change Log"]
 )
 
+# --- Overview Tab ---
+# Shows a summary of the project, the most recent logged change, and a score trend
+# chart built from project["score_history"].
 with overview_tab:
     st.header("Project Overview")
 
@@ -397,6 +519,8 @@ with overview_tab:
         import altair as alt
 
         df = pd.DataFrame(project["score_history"])
+        # Use the list's true insertion order (not the text label) so the chart is
+        # guaranteed to read left-to-right in chronological order
         df["order"] = range(len(df))
         df = df.sort_values("order")
 
@@ -418,7 +542,12 @@ with overview_tab:
         st.altair_chart(chart, use_container_width=True)
     else:
         st.info("Generate at least two updates (Requirement, Planning, or Dev Guidance) to see a score trend chart.")
-        
+
+# --- Requirement Tab ---
+# Collects the raw feature idea, business goal, and constraints, then sends them to the
+# AI for a structured requirement analysis (summary, user stories, missing questions,
+# acceptance criteria, edge cases, out-of-scope items, dependencies) plus a rubric-based
+# 0-100 quality score.
 with req_tab:
     st.header("Requirement Gathering")
 
@@ -517,6 +646,8 @@ with req_tab:
         with st.spinner("Analyzing requirement..."):
             result = call_ai(prompt)
 
+        # Parse the AI's JSON response into the score card and a formatted display string.
+        # Falls back to showing the raw text if parsing fails, rather than crashing.
         try:
             parsed = json.loads(result)
             project["scores"]["requirement_quality"] = parsed["quality_score"]
@@ -554,6 +685,11 @@ with req_tab:
         st.write(project["requirement_output"])
 
 
+# --- Planning Tab ---
+# Shows the live (non-AI) Capacity Fit / Dependency Risk assessment, then generates a
+# detailed, role-assigned, numbered project plan via AI once a requirement analysis
+# exists. Tracks whether the plan is stale relative to its inputs and prompts the user
+# to regenerate when something relevant has changed.
 with plan_tab:
     st.header("Project Planning")
 
@@ -567,6 +703,9 @@ with plan_tab:
     if not project["requirement_output"]:
         st.info("Fill out and analyze the Requirement tab first — planning works best once the requirement is clearer.")
     else:
+        # Determine whether the existing plan is stale relative to the current inputs,
+        # and which specific fields changed, so the user gets a specific nudge rather
+        # than a generic "something changed" message.
         current_hash = get_plan_inputs_hash(project)
         is_stale = project.get("last_plan_hash") != current_hash
         has_existing_plan = bool(project["planning_output"])
@@ -618,8 +757,13 @@ with plan_tab:
                or "Build daily usage breakdown UI component."
 
             2. ASSIGNED_TO: Assign exactly which team member(s) from TEAM own this step.
-               - Use ONLY roles/people that literally appear in TEAM. Never invent a role not mentioned
-                 (e.g. do not assign to "Designer" if no designer is listed).
+               - CRITICAL: Use ONLY roles/people that literally appear in the TEAM field above. If TEAM says
+                 "1 QA" and nothing else, then EVERY single step's assigned_to must be "QA" — there is no
+                 backend developer, frontend developer, or designer available, even if the work described
+                 would normally need one. Do not invent, assume, or default to a role that isn't in TEAM.
+               - If the described work genuinely requires a skill nobody on TEAM has, still assign it to the
+                 closest available role and mention the skills gap in that step's "risk" field instead of
+                 inventing a new team member.
                - If TEAM lists multiple people in the same role (e.g. "2 backend developers"), refer to them as
                  "Backend developer 1" and "Backend developer 2" ONLY when splitting their work meaningfully improves
                  parallelization — otherwise just say "Backend developer(s)."
@@ -678,12 +822,32 @@ with plan_tab:
             with st.spinner("Generating project plan..."):
                 result = call_ai(prompt)
 
+            # Parse the plan JSON, build the formatted display text (with role-colored
+            # owners and subtasks), update scores, and remember the inputs this plan was
+            # generated from (used by the staleness check above).
             try:
                 parsed = json.loads(result)
                 project["scores"]["planning_confidence"] = parsed["confidence_score"]
 
                 project["num_plan_steps"] = len(parsed["steps"])
                 record_score_snapshot(project, "Planning updated")
+
+                project["num_plan_steps"] = len(parsed["steps"])
+                record_score_snapshot(project, "Planning updated")
+
+                # Validate that every assigned role actually appears in the team text —
+                # the AI doesn't always follow this rule reliably on its own
+                team_lower = project["team"].lower()
+                invalid_role_warnings = []
+                for step in parsed["steps"]:
+                    assigned = step.get("assigned_to", "")
+                    for role_part in re.split(r',| and ', assigned):
+                        role_part = role_part.strip().lower()
+                        role_base = re.sub(r'\s*\(?\d+\)?\s*$', '', role_part).replace("(s)", "").strip()
+                        if role_base and role_base.split()[0] not in team_lower:
+                            invalid_role_warnings.append(f"Step '{step['title']}' assigned to '{step['assigned_to']}', which doesn't match your team.")
+
+                steps_text = ""
 
                 steps_text = ""
                 for i, step in enumerate(parsed["steps"], start=1):
@@ -720,6 +884,8 @@ with plan_tab:
                 project["planning_output"] = result
                 st.warning("Got a response, but couldn't parse the score. Showing raw output instead.")
 
+            if invalid_role_warnings:
+                st.warning("The plan assigned roles that don't match your team — you may want to regenerate: " + " ".join(invalid_role_warnings[:2]))
             st.success("Project plan generated!")
             st.rerun()
 
@@ -727,6 +893,11 @@ with plan_tab:
             st.subheader("Project Plan")
             st.write(project["planning_output"])
 
+# --- Dev Guidance Tab ---
+# Once a project plan exists, lets the user ask a specific technical question and
+# generates a detailed, numbered technical breakdown (with illustrative code snippets,
+# edge cases, security considerations, and open questions) plus a rubric-based
+# development readiness score.
 with dev_tab:
     st.header("Development Guidance")
 
@@ -796,6 +967,8 @@ with dev_tab:
             with st.spinner("Generating development guidance..."):
                 result = call_ai(prompt)
 
+            # Parse the JSON response into score + formatted display text, including
+            # rendering any illustrative code snippets as proper markdown code blocks.
             try:
                 parsed = json.loads(result)
                 project["scores"]["development_readiness"] = parsed["readiness_score"]
@@ -831,6 +1004,10 @@ with dev_tab:
             st.subheader("Development Guidance")
             st.write(project["dev_guidance_output"])
 
+# --- Change Log Tab ---
+# Displays every recorded change, most recent first, each with its AI-generated impact
+# summary and a word-level diff (unchanged text in grey, new/changed text highlighted)
+# for every field that changed in that entry.
 with log_tab:
     st.header("Change Log")
 
@@ -851,8 +1028,3 @@ with log_tab:
                     st.markdown(f":gray[Before: {values['before']}]")
                     st.markdown(f"After: {diffed}")
                     st.markdown("")  # small spacing between fields
-                    if project["change_log"]:
-                        last_entry = project["change_log"][-1]
-                    
-
-
